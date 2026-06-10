@@ -45,7 +45,7 @@
 	branch = pmm-3.7.1
 [submodule "pmm-dump"]
 	path = sources/pmm-dump
-	url = https://github.com/percona/pmm-dump
+	url = https://github.com/datacosmos-br/pmm-dump.git
 	branch = pmm-3.7.1
 [submodule "watchtower"]
 	path = sources/watchtower/src/github.com/percona/watchtower
