@@ -1,0 +1,78 @@
+name: Sync with Upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Segunda 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_branch:
+        description: 'Upstream branch to sync'
+        required: true
+        default: 'pmm-3.8.1'
+      our_branch:
+        description: 'Our branch to update'
+        required: true
+        default: 'feat/auto-detect-env-vars'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Checkout our branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.our_branch || 'feat/auto-detect-env-vars' }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: 'recursive'
+
+      - name: Configure Git
+        run: |
+          git config user.name "datacosmos-bot"
+          git config user.email "bot@datacosmos.com.br"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/Percona-Lab/pmm-submodules.git
+
+      - name: Fetch upstream
+        run: git fetch upstream ${{ github.event.inputs.upstream_branch || 'pmm-3.8.1' }}
+
+      - name: Check if upstream is ahead
+        id: check
+        run: |
+          OUR_BRANCH="${{ github.event.inputs.our_branch || 'feat/auto-detect-env-vars' }}"
+          UPSTREAM_BRANCH="upstream/${{ github.event.inputs.upstream_branch || 'pmm-3.8.1' }}"
+          AHEAD=$(git log --oneline $OUR_BRANCH..$UPSTREAM_BRANCH | wc -l)
+          echo "upstream_ahead=$AHEAD" >> $GITHUB_OUTPUT
+          echo "Upstream is $AHEAD commits ahead"
+
+      - name: Merge upstream
+        if: steps.check.outputs.upstream_ahead != '0'
+        run: |
+          OUR_BRANCH="${{ github.event.inputs.our_branch || 'feat/auto-detect-env-vars' }}"
+          UPSTREAM_BRANCH="upstream/${{ github.event.inputs.upstream_branch || 'pmm-3.8.1' }}"
+          git merge $UPSTREAM_BRANCH --no-edit || echo "merge_failed=true" >> $GITHUB_OUTPUT
+
+      - name: Push if merge succeeded
+        if: steps.check.outputs.upstream_ahead != '0' && steps.merge.outputs.merge_failed != 'true'
+        run: |
+          OUR_BRANCH="${{ github.event.inputs.our_branch || 'feat/auto-detect-env-vars' }}"
+          git push origin $OUR_BRANCH
+
+      - name: Create issue on merge conflict
+        if: steps.check.outputs.upstream_ahead != '0' && failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `🔄 Upstream sync conflict: ${{ github.event.inputs.upstream_branch || 'pmm-3.8.1' }}`;
+            const body = `O merge automático com o upstream falhou por conflitos.\n\n- Upstream: Percona-Lab/pmm-submodules@${{ github.event.inputs.upstream_branch || 'pmm-3.8.1' }}\n- Nosso branch: ${{ github.event.inputs.our_branch || 'feat/auto-detect-env-vars' }}\n\nPor favor, resolva manualmente.`;
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['upstream-sync', 'blocked']
+            });
