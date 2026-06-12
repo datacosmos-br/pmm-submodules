@@ -1,0 +1,19 @@
+.gitignore
+  s_56cda4a5ac4207::t_dffa4045f8545d 10-11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "84382352a000d459e400524530071002427dd4ff",
+  "prompts": {},
+  "sessions": {
+    "s_56cda4a5ac4207": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "019eb9f7-6978-70f1-9f41-f2e9fd7a1286",
+        "model": "unknown"
+      },
+      "human_author": "Marlon Costa <marlonsc@gmail.com>"
+    }
+  }
+}
