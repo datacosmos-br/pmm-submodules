@@ -7,3 +7,5 @@ results/
 .git-sources
 .vscode/
 .idea/
+__pycache__/
+*.py[cod]
