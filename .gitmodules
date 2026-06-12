@@ -45,8 +45,8 @@
 	branch = pmm-3.8.0
 [submodule "pmm-dump"]
 	path = sources/pmm-dump
-	url = https://github.com/percona/pmm-dump
-	branch = pmm-3.8.0
+	url = https://github.com/datacosmos-br/pmm-dump.git
+	branch = feat/auto-detect-env-vars-v3.8.0
 [submodule "watchtower"]
 	path = sources/watchtower/src/github.com/percona/watchtower
 	url = https://github.com/percona/watchtower
