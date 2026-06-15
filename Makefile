@@ -9,6 +9,9 @@ endif
 
 default: help
 
+# datacosmos aggregator-root build/release targets (dc-build, dc-publish, dc-release, dc-test-*).
+-include Makefile.datacosmos
+
 help:                       ## Display this help message.
 	@echo "Please use \`make <target>\` where <target> is one of:"
 	@grep '^[a-zA-Z]' $(MAKEFILE_LIST) | \
