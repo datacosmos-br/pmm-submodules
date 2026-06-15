@@ -33,12 +33,12 @@ IMAGE_ARCH    ?= amd64
 DC_PMM_DUMP_REPO ?= https://github.com/datacosmos-br/pmm-dump.git
 
 # Files that carry datacosmos behavior and MUST survive any upstream sync.
+# (scripts/dc-bump-forks + scripts/dc-git-status are tracked for a future port —
+# cosmos-main-nb0w — and intentionally not listed until they exist here.)
 DC_RELEASE_COMMIT_PATHS := \
 	.gitmodules \
 	Makefile.datacosmos \
 	.github/workflows/datacosmos-release.yml \
-	scripts/dc-bump-forks \
-	scripts/dc-git-status \
 	docs/datacosmos \
 	AGENTS.md \
 	CLAUDE.md
