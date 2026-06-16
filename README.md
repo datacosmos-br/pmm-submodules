@@ -1,5 +1,15 @@
 # PMM Submodules
 
+> **datacosmos fork — aggregator build root.** This repo is the upstream-native build
+> root for the datacosmos PMM distribution. `sources/pmm` is the datacosmos pmm fork
+> (de-recursed: no `pmm-submodules` back-reference, so a recursive submodule init is
+> safe) and `sources/pmm-dump` is the datacosmos pmm-dump fork pinned to a `vX.Y.Z-dcN`
+> tag; the other `sources/*` track percona upstreams. Build/release: `make dc-build`
+> (runs the upstream `build-server` in-place from `sources/pmm`), `make dc-publish`
+> (GHCR), and a `v*-dc*` tag triggers `.github/workflows/datacosmos-release.yml`. See
+> `Makefile.datacosmos` (`make dc-help`) and `docs/datacosmos/BUILD.md`. The sections
+> below describe the upstream percona/Jenkins feature-build flow this fork is based on.
+
 This repository serves the purpose of creating and/or updating the feature builds for PMM Server and PMM Client. It is auxiliary
 to our build system managed by Jenkins as it helps pull the right branches from different repositories that PMM [consists of](https://github.com/percona/pmm/blob/main/CONTRIBUTING.md#project-repos-structure).
 

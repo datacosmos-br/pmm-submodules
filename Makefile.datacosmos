@@ -1,0 +1,183 @@
+###############################################################################
+# Makefile.datacosmos - aggregator-root PMM build and release helpers.
+#
+# This repository (pmm-submodules) is the UPSTREAM-NATIVE build root: `sources/*`
+# holds every component as a real submodule, and the datacosmos pmm fork lives at
+# sources/pmm/src/github.com/percona/pmm (de-recursed: it no longer references
+# pmm-submodules, so there is NO circular graph). A plain recursive submodule
+# init is therefore safe and the upstream build-server runs in-place from the
+# pmm source — no symlink/re-clone hacks, staying close to upstream.
+#
+# Only datacosmos concerns live here: -dc versioning, GHCR publishing, fork
+# pinning checks, and delegating local tests to the pmm source.
+###############################################################################
+
+SHELL := /bin/bash -o pipefail
+
+PMM_SRC      := sources/pmm/src/github.com/percona/pmm
+PMM_DUMP_SRC := sources/pmm-dump
+
+# PMM_VERSION is the upstream stable base (e.g. 3.8.0), read from the pmm source
+# (populated by `make dc-prepare`). Lazy: empty until sources/pmm exists, resolved
+# when a build/release recipe runs (dc-prepare is a prerequisite of dc-build).
+PMM_VERSION ?= $(shell git -C $(PMM_SRC) describe --tags --abbrev=0 \
+	--match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*-dc*' 2>/dev/null | sed 's/^v//')
+
+DIST          ?= el9
+ROOT_DIR      ?= $(CURDIR)
+ARTIFACT_DIR  ?= $(abspath $(CURDIR)/../pmm-artifacts)
+GHCR_NAMESPACE ?= ghcr.io/datacosmos-br
+GHCR_USER     ?=
+DC_VERSION    ?= $(PMM_VERSION)-dev
+IMAGE_ARCH    ?= amd64
+DC_PMM_DUMP_REPO ?= https://github.com/datacosmos-br/pmm-dump.git
+
+# Files that carry datacosmos behavior and MUST survive any upstream sync.
+# (scripts/dc-bump-forks + scripts/dc-git-status are tracked for a future port —
+# cosmos-main-nb0w — and intentionally not listed until they exist here.)
+DC_RELEASE_COMMIT_PATHS := \
+	.gitmodules \
+	Makefile.datacosmos \
+	.github/workflows/datacosmos-release.yml \
+	docs/datacosmos \
+	AGENTS.md \
+	CLAUDE.md
+
+FULL_VERSION  = $(PMM_VERSION)-$(shell git rev-list --count HEAD)
+CLIENT_IMAGE  ?= pmm-local/pmm-client:$(FULL_VERSION)
+SERVER_IMAGE  ?= pmm-local/pmm-server:$(FULL_VERSION)
+CLIENT_PUBLISH_IMAGE ?= $(GHCR_NAMESPACE)/pmm-client:$(DC_VERSION)-$(IMAGE_ARCH)
+SERVER_PUBLISH_IMAGE ?= $(GHCR_NAMESPACE)/pmm-server:$(DC_VERSION)-$(IMAGE_ARCH)
+
+export ROOT_DIR
+export RPMBUILD_DIST := $(DIST)
+unexport PUSH_DOCKER
+
+# Next -dc tag from the aggregator's own upstream sync position. Overridable with
+# an explicit DC_VERSION (e.g. for v3.8.0-dcN continuity with downstream consumers).
+UPSTREAM_BRANCH ?= upstream/v3
+define DC_RESOLVE_TAG_SCRIPT
+if upstream_ref=$$(git rev-parse -q --verify MERGE_HEAD 2>/dev/null); then :; \
+elif upstream_ref=$$(git merge-base HEAD $(UPSTREAM_BRANCH) 2>/dev/null); then :; \
+else upstream_ref=$$(git rev-parse HEAD); fi; \
+stable=$$(git -C $(PMM_SRC) tag --points-at HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null | sed -n -E '/^v[0-9]+\.[0-9]+\.[0-9]+$$/p' | sort -V | sed -n '$$p'); \
+if [ -n "$$stable" ]; then base="$${stable}-dc"; else base="v$(PMM_VERSION)-dc"; fi; \
+last=$$(git tag -l "$${base}*" | sed -n "s/^$${base}\([0-9][0-9]*\)$$/\1/p" | sort -n | sed -n '$$p'); \
+tag="$$base$$(( $${last:-0} + 1 ))"
+endef
+
+.PHONY: dc-help
+dc-help: ## List datacosmos build/release targets
+	@grep -E '^[a-zA-Z0-9_.-]+:.*?## ' $(lastword $(MAKEFILE_LIST)) | \
+		awk -F ':.*?## ' '{printf "  %-22s%s\n", $$1, $$2}'
+
+.PHONY: dc-prepare
+dc-prepare: ## Init all sources (pinned, recursive — safe: no circular graph)
+	git submodule update --init --recursive --jobs 10
+	mkdir -p $(ROOT_DIR)/tmp $(ROOT_DIR)/results $(ARTIFACT_DIR)
+	chmod 0777 $(ROOT_DIR)/tmp $(ROOT_DIR)/results
+	echo "$(PMM_VERSION)" > $(ROOT_DIR)/VERSION
+
+.PHONY: dc-doctor
+dc-doctor: ## Validate build preconditions: clean tree, de-recursed leaf, pmm-dump tag pin
+	@rc=0; \
+	if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1; then \
+		echo "FAIL: merge/cherry-pick in progress"; rc=1; \
+	else echo "OK: no merge/cherry-pick in progress"; fi; \
+	dirty=$$(git status --porcelain --untracked-files=no); \
+	if [ -n "$$dirty" ]; then echo "FAIL: uncommitted tracked changes:"; echo "$$dirty"; rc=1; \
+	else echo "OK: working tree clean"; fi; \
+	dump_branch=$$(git config -f .gitmodules submodule.pmm-dump.branch 2>/dev/null || true); \
+	case "$$dump_branch" in \
+		v[0-9]*) echo "OK: pmm-dump pinned to tag $$dump_branch" ;; \
+		'') echo "WARN: pmm-dump branch pin not readable" ;; \
+		*) echo "FAIL: pmm-dump pinned to moving branch '$$dump_branch' (expected vX.Y.Z-dcN)"; rc=1 ;; \
+	esac; \
+	if git config -f $(PMM_SRC)/.gitmodules submodule.pmm-submodules.url >/dev/null 2>&1; then \
+		echo "FAIL: sources/pmm still declares a pmm-submodules back-ref (recursion not removed)"; rc=1; \
+	else echo "OK: sources/pmm is de-recursed (no pmm-submodules back-ref)"; fi; \
+	exit $$rc
+
+.PHONY: dc-build
+dc-build: .dc-guard dc-prepare ## Build native linux images in-place and collect artifacts
+	# build-server runs in-place from the pmm source; ROOT_DIR=$(CURDIR) (aggregator),
+	# so sources/* and sources/pmm/.../pmm are discovered natively (upstream layout).
+	cd $(ROOT_DIR) && ROOT_DIR=$(ROOT_DIR) RPMBUILD_DIST=$(DIST) SKIP_S3_CACHE=1 \
+		DOCKER_CLIENT_TAG=$(CLIENT_IMAGE) DOCKER_TAG=$(SERVER_IMAGE) \
+		$(ROOT_DIR)/$(PMM_SRC)/build/scripts/build-server
+	$(MAKE) -f Makefile.datacosmos dc-artifacts
+
+.PHONY: dc-artifacts
+dc-artifacts: ## Collect built RPMs and images into ARTIFACT_DIR
+	mkdir -p $(ARTIFACT_DIR)/server-rpms
+	test -d $(ROOT_DIR)/results
+	cp -a $(ROOT_DIR)/results/. $(ARTIFACT_DIR)/
+	test -d $(ROOT_DIR)/tmp/pmm-server/RPMS
+	rpm_count=$$(find $(ROOT_DIR)/tmp/pmm-server/RPMS -name '*.rpm' -type f | wc -l); \
+	if [ "$$rpm_count" -eq 0 ]; then \
+		echo "No server RPM artifacts found in $(ROOT_DIR)/tmp/pmm-server/RPMS"; \
+		exit 1; \
+	fi; \
+	find $(ROOT_DIR)/tmp/pmm-server/RPMS -name '*.rpm' -type f \
+		-exec cp -f {} $(ARTIFACT_DIR)/server-rpms/ \;
+	echo "Artifacts in $(ARTIFACT_DIR)"
+
+.PHONY: dc-publish
+dc-publish: .dc-login ## Publish images built by dc-build to ghcr.io/datacosmos-br
+	docker tag $(CLIENT_IMAGE) $(CLIENT_PUBLISH_IMAGE)
+	docker tag $(SERVER_IMAGE) $(SERVER_PUBLISH_IMAGE)
+	docker push $(CLIENT_PUBLISH_IMAGE)
+	docker push $(SERVER_PUBLISH_IMAGE)
+
+.PHONY: dc-test-local dc-test-agent dc-test-qan dc-test-clickhouse
+dc-test-local: ## Run the pmm source's local test suite (delegates into sources/pmm)
+	$(MAKE) -C $(PMM_SRC) dc-test-local
+dc-test-agent:
+	$(MAKE) -C $(PMM_SRC) dc-test-agent
+dc-test-qan:
+	$(MAKE) -C $(PMM_SRC) dc-test-qan
+dc-test-clickhouse:
+	$(MAKE) -C $(PMM_SRC) dc-test-clickhouse
+
+.PHONY: dc-next
+dc-next: .dc-fetch-tags ## Print the next -dc release tag (override with DC_RELEASE_TAG)
+	@$(DC_RESOLVE_TAG_SCRIPT); printf "%s\n" "$$tag"
+
+.PHONY: dc-release
+dc-release: .dc-clean-worktree .dc-fetch-tags ## Create+push the next -dc tag (DC_RELEASE_TAG overrides)
+	@if [ -n "$(DC_RELEASE_TAG)" ]; then tag="$(DC_RELEASE_TAG)"; else $(DC_RESOLVE_TAG_SCRIPT); fi; \
+	git tag -a "$$tag" -m "datacosmos PMM $$tag (@ $$(git rev-parse --short HEAD))"; \
+	git push origin "$$tag"; \
+	printf "released %s\n" "$$tag"
+
+.PHONY: dc-clean
+dc-clean: ## Move build/artifact dirs aside (.bak)
+	mv $(ROOT_DIR)/tmp $(ROOT_DIR)/tmp.bak 2>/dev/null || true
+	mv $(ROOT_DIR)/results $(ROOT_DIR)/results.bak 2>/dev/null || true
+
+.PHONY: .dc-guard
+.dc-guard:
+	@if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1; then \
+		echo "ERROR: merge/cherry-pick in progress; resolve+commit before building."; exit 1; fi
+
+.PHONY: .dc-clean-worktree
+.dc-clean-worktree:
+	@if [ -n "$$(git status --porcelain -- $(DC_RELEASE_COMMIT_PATHS))" ]; then \
+		echo "Release files have uncommitted changes; commit before dc-release"; \
+		git status --short -- $(DC_RELEASE_COMMIT_PATHS); exit 1; fi
+
+.PHONY: .dc-fetch-tags
+.dc-fetch-tags:
+	@git fetch --tags --quiet origin 2>/dev/null || true
+
+.PHONY: .dc-login
+.dc-login:
+	@if [ -n "$$GITHUB_ACTIONS" ]; then \
+		echo "$$GH_TOKEN" | docker login ghcr.io -u "$$GITHUB_ACTOR" --password-stdin; \
+	elif [ -n "$$GHCR_TOKEN" ]; then \
+		: "$${GHCR_USER:?set GHCR_USER for local ghcr.io login}"; \
+		echo "$$GHCR_TOKEN" | docker login ghcr.io -u "$$GHCR_USER" --password-stdin; \
+	else \
+		: "$${GHCR_USER:?set GHCR_USER for local ghcr.io login}"; \
+		gh auth token | docker login ghcr.io -u "$$GHCR_USER" --password-stdin; \
+	fi
