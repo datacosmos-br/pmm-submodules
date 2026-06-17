@@ -71,9 +71,10 @@ the release helper uses `vX.Y.Z-dc<N>`. Otherwise it uses
 `v3-<upstream commit ISO date>-dc<N>`, with `N` incrementing for that date.
 
 ```bash
-make dc-next                  # next tag, e.g. v3.8.0-dc1 or v3-2026-06-11-dc1
-make dc-release               # creates and pushes that tag
+make dc-release               # pushes the forks + creates and pushes the computed -dc tag
 ```
+
+`dc-release` computes the next tag itself (no separate `dc-next` step) and prints it.
 
 The earlier date scheme `v3-<ISO date>-<upstream commit count>` still works if
 such a tag is pushed manually - the workflow triggers on both `v*-dc*` and
@@ -88,17 +89,19 @@ nearest upstream semver tag - it stays a clean `X.Y.Z`.
 ## Building (datacosmos pipeline)
 
 `Makefile.datacosmos` is included by the root `Makefile`, but only exposes
-datacosmos-specific `dc-*` targets. Common targets such as `release`, `check`,
+datacosmos-specific `dc-*` verbs. Common targets such as `release`, `check`,
 `clean`, and `gen` stay owned by upstream Makefiles.
 
+The full build+publish runs in CI under a single verb; the operator does not run
+it by hand:
+
 ```bash
-make dc-build    # prepare + upstream client/server build + artifacts
-make dc-publish  # push the built images to ghcr.io/datacosmos-br
-make dc-clean    # remove only datacosmos external build/artifact dirs
+make dc-validate   # local gate: go build/vet/test on both forks + source sanity
+make dc-ci         # CI ONLY: clone pinned forks, build images+RPMs, push to GHCR
 ```
 
-Local builds default to `IMAGE_ARCH=amd64`; set `IMAGE_ARCH=arm64` only on an
-arm64 host or runner so the image tag matches the native package build.
+`make dc-ci` defaults to `IMAGE_ARCH=amd64`; the CI matrix sets `IMAGE_ARCH=arm64`
+on the native arm64 runner so the image tag matches the package build.
 
 ## Validation Integrity
 
@@ -110,13 +113,17 @@ Compose services, ClickHouse matrix nodes, generated files, or fork metadata,
 make those real dependencies work and validate against them. Evidence must cite
 the command, exit code, and decisive output.
 
-`make env TARGET=dc-test-local` is the devcontainer validation path. It starts
-the upstream daemon containers through Docker and runs the real checks/tests.
-When Docker is remote (`DOCKER_HOST=tcp://...`), service tests must discover the
-daemon host from `PMM_TEST_SERVICE_HOST` or `DOCKER_HOST`, and compose/run
-targets may bind published ports to `0.0.0.0` via `PMM_TEST_BIND_HOST` so the
-devcontainer can reach them. Local Docker keeps loopback binding by default.
-Do not replace this with skips, synthetic services, or narrower unit tests.
+`make dc-validate` is the aggregator's local gate: `go build`/`go vet`/`go test`
+on both forks through the symlinks, plus source sanity. It is the unit
+gate run before `dc-release`.
+
+The heavier container-backed suite (PMM daemons, ClickHouse matrix, agent/QAN
+tests) lives in the pmm source's own `Makefile.datacosmos` (`dc-test-local` and
+friends) and is run there directly when needed — e.g. `make -C sources/pmm
+dc-test-local`. When Docker is remote (`DOCKER_HOST=tcp://...`), those service
+tests discover the daemon host from `PMM_TEST_SERVICE_HOST` or `DOCKER_HOST`, and
+compose/run targets may bind published ports to `0.0.0.0` via `PMM_TEST_BIND_HOST`.
+Do not replace those checks with skips, synthetic services, or narrower unit tests.
 
 For local publishing, set `GHCR_USER` to the GitHub login that owns the token
 used for `ghcr.io`; CI uses `GITHUB_ACTOR`.
@@ -132,10 +139,9 @@ fork can safely reuse public Percona infrastructure:
   `s3://pmm-build-cache` anonymously and avoid rebuilding Grafana and other
   heavy components.
 - The current datacosmos release workflow publishes linux/amd64 and linux/arm64.
-- Images are built locally first by `dc-build` and published to
-  `ghcr.io/datacosmos-br` only by the explicit `dc-publish` target.
-- Datacosmos source bumps use `https://github.com/datacosmos-br/pmm-submodules.git`;
-  that fork pins `pmm-dump` to `https://github.com/datacosmos-br/pmm-dump.git`.
+- Images are built and pushed to `ghcr.io/datacosmos-br` by `dc-ci` (CI only).
+- The pmm/pmm-dump sources are symlinks to local forks; `dc-ci` materializes them
+  by cloning `DC_PMM_REPO@DC_PMM_REF` and `DC_PMM_DUMP_REPO@DC_PMM_DUMP_REF`.
 
 ### Local-only mode
 
@@ -143,11 +149,11 @@ For a fully local rebuild, set the overrides explicitly:
 
 ```bash
 docker build --pull --tag pmm-rpmbuild:local --file build/docker/rpmbuild/Dockerfile.el9 build/docker/rpmbuild
-RPMBUILD_DOCKER_IMAGE=pmm-rpmbuild:local SKIP_S3_CACHE=1 make dc-build
+RPMBUILD_DOCKER_IMAGE=pmm-rpmbuild:local SKIP_S3_CACHE=1 make dc-ci
 ```
 
-`make dc-build` materialises the build tree under `$(ROOT_DIR)` (default
-`../pmm-build-root`, **outside** the repo).
+`make dc-ci` materialises the build tree under `$(ROOT_DIR)` and collects artifacts
+into `ARTIFACT_DIR` (default `../pmm-artifacts`, **outside** the repo).
 
 ### Build status
 

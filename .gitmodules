@@ -1,9 +1,5 @@
 # PMM Client and Server Components (monorepo)
 # datacosmos fork of percona/pmm (de-recursed: no pmm-submodules back-ref).
-[submodule "pmm"]
-	path = sources/pmm/src/github.com/percona/pmm
-	url = https://github.com/datacosmos-br/pmm.git
-	branch = sync/tibi-holmes
 
 # PMM Client
 [submodule "node_exporter"]
@@ -44,10 +40,6 @@
 	path = sources/grafana/src/github.com/grafana/grafana
 	url = https://github.com/percona/grafana
 	branch = pmm-3.8.0
-[submodule "pmm-dump"]
-	path = sources/pmm-dump
-	url = https://github.com/datacosmos-br/pmm-dump.git
-	branch = v0.8.1-dc2
 [submodule "watchtower"]
 	path = sources/watchtower/src/github.com/percona/watchtower
 	url = https://github.com/percona/watchtower

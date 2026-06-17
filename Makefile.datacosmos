@@ -1,25 +1,35 @@
 ###############################################################################
 # Makefile.datacosmos - aggregator-root PMM build and release helpers.
 #
-# This repository (pmm-submodules) is the UPSTREAM-NATIVE build root: `sources/*`
-# holds every component as a real submodule, and the datacosmos pmm fork lives at
-# sources/pmm/src/github.com/percona/pmm (de-recursed: it no longer references
-# pmm-submodules, so there is NO circular graph). A plain recursive submodule
-# init is therefore safe and the upstream build-server runs in-place from the
-# pmm source — no symlink/re-clone hacks, staying close to upstream.
+# This repository (pmm-submodules) is the build root. The exporter components
+# (node_exporter, grafana, mysqld_exporter, ...) are real submodules under
+# sources/*. The pmm and pmm-dump sources are NOT submodules: they are symlinks
+# to the operator's live forks (apps/pmm, apps/pmm-dump) for local development.
+#   sources/pmm      -> ../../../pmm       (datacosmos pmm fork, top-level go.mod)
+#   sources/pmm-dump -> ../../../pmm-dump
+# In CI (where only this repo is checked out) those symlinks dangle, so `dc-ci`
+# MATERIALIZES them by cloning the pinned forks before building.
 #
-# Only datacosmos concerns live here: -dc versioning, GHCR publishing, fork
-# pinning checks, and delegating local tests to the pmm source.
+# The whole datacosmos cycle is just two operator verbs plus one CI verb:
+#   make dc-validate   # unit-test both forks + source sanity (local gate)
+#   make dc-release    # push forks to datacosmos-br + tag the release (triggers CI)
+#   make dc-ci         # CI ONLY: materialize forks, build images+RPMs, push to GHCR
 ###############################################################################
 
 SHELL := /bin/bash -o pipefail
 
-PMM_SRC      := sources/pmm/src/github.com/percona/pmm
-PMM_DUMP_SRC := sources/pmm-dump
+# pmm / pmm-dump sources (symlinks locally, materialized clones in CI).
+PMM_SRC              := sources/pmm
+PMM_DUMP_SRC         := sources/pmm-dump
+DC_PMM_REPO          ?= https://github.com/datacosmos-br/pmm.git
+DC_PMM_REF           ?= feat/v3.8.0-dc
+DC_PMM_REMOTE        ?= origin
+DC_PMM_DUMP_REPO     ?= https://github.com/datacosmos-br/pmm-dump.git
+DC_PMM_DUMP_REF      ?= v0.8.1-dc2
+DC_PMM_DUMP_REMOTE   ?= origin
 
-# PMM_VERSION is the upstream stable base (e.g. 3.8.0), read from the pmm source
-# (populated by `make dc-prepare`). Lazy: empty until sources/pmm exists, resolved
-# when a build/release recipe runs (dc-prepare is a prerequisite of dc-build).
+# Upstream stable base (e.g. 3.8.1), read from the pmm source. Lazy: resolved when
+# a recipe runs (after the symlink/clone is present).
 PMM_VERSION ?= $(shell git -C $(PMM_SRC) describe --tags --abbrev=0 \
 	--match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*-dc*' 2>/dev/null | sed 's/^v//')
 
@@ -30,11 +40,8 @@ GHCR_NAMESPACE ?= ghcr.io/datacosmos-br
 GHCR_USER     ?=
 DC_VERSION    ?= $(PMM_VERSION)-dev
 IMAGE_ARCH    ?= amd64
-DC_PMM_DUMP_REPO ?= https://github.com/datacosmos-br/pmm-dump.git
 
-# Files that carry datacosmos behavior and MUST survive any upstream sync.
-# (scripts/dc-bump-forks + scripts/dc-git-status are tracked for a future port —
-# cosmos-main-nb0w — and intentionally not listed until they exist here.)
+# Files that carry datacosmos behavior and MUST be committed before dc-release.
 DC_RELEASE_COMMIT_PATHS := \
 	.gitmodules \
 	Makefile.datacosmos \
@@ -53,8 +60,7 @@ export ROOT_DIR
 export RPMBUILD_DIST := $(DIST)
 unexport PUSH_DOCKER
 
-# Next -dc tag from the aggregator's own upstream sync position. Overridable with
-# an explicit DC_VERSION (e.g. for v3.8.0-dcN continuity with downstream consumers).
+# Next -dc tag from the aggregator's upstream sync position. Override with DC_RELEASE_TAG.
 UPSTREAM_BRANCH ?= upstream/v3
 define DC_RESOLVE_TAG_SCRIPT
 if upstream_ref=$$(git rev-parse -q --verify MERGE_HEAD 2>/dev/null); then :; \
@@ -67,48 +73,72 @@ tag="$$base$$(( $${last:-0} + 1 ))"
 endef
 
 .PHONY: dc-help
-dc-help: ## List datacosmos build/release targets
+dc-help: ## List datacosmos verbs
 	@grep -E '^[a-zA-Z0-9_.-]+:.*?## ' $(lastword $(MAKEFILE_LIST)) | \
-		awk -F ':.*?## ' '{printf "  %-22s%s\n", $$1, $$2}'
+		awk -F ':.*?## ' '{printf "  %-14s%s\n", $$1, $$2}'
 
-.PHONY: dc-prepare
-dc-prepare: ## Init all sources (pinned, recursive — safe: no circular graph)
+# ─────────────────────────────────────────────────────────────────────────────
+# Operator verb 1: validate
+# ─────────────────────────────────────────────────────────────────────────────
+.PHONY: dc-validate
+dc-validate: ## Unit-test pmm + pmm-dump forks and check source sanity (local gate)
+	@rc=0; \
+	for src in $(PMM_SRC) $(PMM_DUMP_SRC); do \
+		if [ ! -f "$$src/go.mod" ]; then \
+			echo "FAIL: $$src does not resolve to a go.mod tree (symlink broken?)"; rc=1; continue; fi; \
+		echo "== tests: $$src =="; \
+		( cd "$$src" && go build ./... && go vet ./... && go test ./... ) || rc=1; \
+	done; \
+	if git config -f $(PMM_SRC)/.gitmodules submodule.pmm-submodules.url >/dev/null 2>&1; then \
+		echo "FAIL: $(PMM_SRC) declares a pmm-submodules back-ref (recursion not removed)"; rc=1; \
+	else echo "OK: $(PMM_SRC) is de-recursed"; fi; \
+	if [ $$rc -eq 0 ]; then echo "dc-validate: OK"; else echo "dc-validate: FAILED"; fi; \
+	exit $$rc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Operator verb 2: release (publish forks + tag -> CI publishes images)
+# ─────────────────────────────────────────────────────────────────────────────
+.PHONY: dc-release
+dc-release: .dc-clean-worktree .dc-fetch-tags ## Push forks to datacosmos-br + create/push the next -dc tag
+	@echo "== publishing fork sources =="; \
+	git -C $(PMM_SRC) push $(DC_PMM_REMOTE) $(DC_PMM_REF); \
+	git -C $(PMM_DUMP_SRC) push $(DC_PMM_DUMP_REMOTE) $(DC_PMM_DUMP_REF); \
+	if [ -n "$(DC_RELEASE_TAG)" ]; then tag="$(DC_RELEASE_TAG)"; else $(DC_RESOLVE_TAG_SCRIPT); fi; \
+	git tag -a "$$tag" -m "datacosmos PMM $$tag (@ $$(git rev-parse --short HEAD))"; \
+	git push origin "$$tag"; \
+	printf "released %s (CI: datacosmos-release.yml builds + publishes amd64+arm64)\n" "$$tag"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CI verb (not for daily use): materialize forks, build, publish images to GHCR
+# ─────────────────────────────────────────────────────────────────────────────
+.PHONY: dc-ci
+dc-ci: ## CI ONLY: clone pinned forks (if missing), build native images+RPMs, push to GHCR
+	@for spec in "$(PMM_SRC)|$(DC_PMM_REPO)|$(DC_PMM_REF)" "$(PMM_DUMP_SRC)|$(DC_PMM_DUMP_REPO)|$(DC_PMM_DUMP_REF)"; do \
+		path=$${spec%%|*}; rest=$${spec#*|}; repo=$${rest%%|*}; ref=$${rest##*|}; \
+		if [ -f "$$path/go.mod" ]; then echo "OK: $$path already present (local symlink)"; continue; fi; \
+		echo "materializing $$path from $$repo @ $$ref"; \
+		rm -f "$$path"; \
+		git clone --depth 1 --branch "$$ref" "$$repo" "$$path"; \
+	done
 	git submodule update --init --recursive --jobs 10
 	mkdir -p $(ROOT_DIR)/tmp $(ROOT_DIR)/results $(ARTIFACT_DIR)
 	chmod 0777 $(ROOT_DIR)/tmp $(ROOT_DIR)/results
 	echo "$(PMM_VERSION)" > $(ROOT_DIR)/VERSION
-
-.PHONY: dc-doctor
-dc-doctor: ## Validate build preconditions: clean tree, de-recursed leaf, pmm-dump tag pin
-	@rc=0; \
-	if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1; then \
-		echo "FAIL: merge/cherry-pick in progress"; rc=1; \
-	else echo "OK: no merge/cherry-pick in progress"; fi; \
-	dirty=$$(git status --porcelain --untracked-files=no); \
-	if [ -n "$$dirty" ]; then echo "FAIL: uncommitted tracked changes:"; echo "$$dirty"; rc=1; \
-	else echo "OK: working tree clean"; fi; \
-	dump_branch=$$(git config -f .gitmodules submodule.pmm-dump.branch 2>/dev/null || true); \
-	case "$$dump_branch" in \
-		v[0-9]*) echo "OK: pmm-dump pinned to tag $$dump_branch" ;; \
-		'') echo "WARN: pmm-dump branch pin not readable" ;; \
-		*) echo "FAIL: pmm-dump pinned to moving branch '$$dump_branch' (expected vX.Y.Z-dcN)"; rc=1 ;; \
-	esac; \
-	if git config -f $(PMM_SRC)/.gitmodules submodule.pmm-submodules.url >/dev/null 2>&1; then \
-		echo "FAIL: sources/pmm still declares a pmm-submodules back-ref (recursion not removed)"; rc=1; \
-	else echo "OK: sources/pmm is de-recursed (no pmm-submodules back-ref)"; fi; \
-	exit $$rc
-
-.PHONY: dc-build
-dc-build: .dc-guard dc-prepare ## Build native linux images in-place and collect artifacts
-	# build-server runs in-place from the pmm source; ROOT_DIR=$(CURDIR) (aggregator),
-	# so sources/* and sources/pmm/.../pmm are discovered natively (upstream layout).
 	cd $(ROOT_DIR) && ROOT_DIR=$(ROOT_DIR) RPMBUILD_DIST=$(DIST) SKIP_S3_CACHE=1 \
 		DOCKER_CLIENT_TAG=$(CLIENT_IMAGE) DOCKER_TAG=$(SERVER_IMAGE) \
 		$(ROOT_DIR)/$(PMM_SRC)/build/scripts/build-server
-	$(MAKE) -f Makefile.datacosmos dc-artifacts
+	$(MAKE) -f Makefile.datacosmos .dc-artifacts
+	$(MAKE) -f Makefile.datacosmos .dc-login
+	docker tag $(CLIENT_IMAGE) $(CLIENT_PUBLISH_IMAGE)
+	docker tag $(SERVER_IMAGE) $(SERVER_PUBLISH_IMAGE)
+	docker push $(CLIENT_PUBLISH_IMAGE)
+	docker push $(SERVER_PUBLISH_IMAGE)
 
-.PHONY: dc-artifacts
-dc-artifacts: ## Collect built RPMs and images into ARTIFACT_DIR
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers (not user-facing)
+# ─────────────────────────────────────────────────────────────────────────────
+.PHONY: .dc-artifacts
+.dc-artifacts:
 	mkdir -p $(ARTIFACT_DIR)/server-rpms
 	test -d $(ROOT_DIR)/results
 	cp -a $(ROOT_DIR)/results/. $(ARTIFACT_DIR)/
@@ -121,44 +151,6 @@ dc-artifacts: ## Collect built RPMs and images into ARTIFACT_DIR
 	find $(ROOT_DIR)/tmp/pmm-server/RPMS -name '*.rpm' -type f \
 		-exec cp -f {} $(ARTIFACT_DIR)/server-rpms/ \;
 	echo "Artifacts in $(ARTIFACT_DIR)"
-
-.PHONY: dc-publish
-dc-publish: .dc-login ## Publish images built by dc-build to ghcr.io/datacosmos-br
-	docker tag $(CLIENT_IMAGE) $(CLIENT_PUBLISH_IMAGE)
-	docker tag $(SERVER_IMAGE) $(SERVER_PUBLISH_IMAGE)
-	docker push $(CLIENT_PUBLISH_IMAGE)
-	docker push $(SERVER_PUBLISH_IMAGE)
-
-.PHONY: dc-test-local dc-test-agent dc-test-qan dc-test-clickhouse
-dc-test-local: ## Run the pmm source's local test suite (delegates into sources/pmm)
-	$(MAKE) -C $(PMM_SRC) dc-test-local
-dc-test-agent:
-	$(MAKE) -C $(PMM_SRC) dc-test-agent
-dc-test-qan:
-	$(MAKE) -C $(PMM_SRC) dc-test-qan
-dc-test-clickhouse:
-	$(MAKE) -C $(PMM_SRC) dc-test-clickhouse
-
-.PHONY: dc-next
-dc-next: .dc-fetch-tags ## Print the next -dc release tag (override with DC_RELEASE_TAG)
-	@$(DC_RESOLVE_TAG_SCRIPT); printf "%s\n" "$$tag"
-
-.PHONY: dc-release
-dc-release: .dc-clean-worktree .dc-fetch-tags ## Create+push the next -dc tag (DC_RELEASE_TAG overrides)
-	@if [ -n "$(DC_RELEASE_TAG)" ]; then tag="$(DC_RELEASE_TAG)"; else $(DC_RESOLVE_TAG_SCRIPT); fi; \
-	git tag -a "$$tag" -m "datacosmos PMM $$tag (@ $$(git rev-parse --short HEAD))"; \
-	git push origin "$$tag"; \
-	printf "released %s\n" "$$tag"
-
-.PHONY: dc-clean
-dc-clean: ## Move build/artifact dirs aside (.bak)
-	mv $(ROOT_DIR)/tmp $(ROOT_DIR)/tmp.bak 2>/dev/null || true
-	mv $(ROOT_DIR)/results $(ROOT_DIR)/results.bak 2>/dev/null || true
-
-.PHONY: .dc-guard
-.dc-guard:
-	@if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1; then \
-		echo "ERROR: merge/cherry-pick in progress; resolve+commit before building."; exit 1; fi
 
 .PHONY: .dc-clean-worktree
 .dc-clean-worktree:

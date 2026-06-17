@@ -5,9 +5,10 @@ name: datacosmos release
 # images from source for linux/amd64 and linux/arm64, pushes the images, and
 # creates a GitHub Release only after both architecture builds pass.
 #
-# This repo is the aggregator build root: sources/pmm is the de-recursed
-# datacosmos pmm fork, so a recursive submodule checkout is SAFE (no circular
-# graph) and the upstream build-server runs in-place.
+# This repo is the aggregator build root. The exporter components are real
+# submodules (recursive checkout below). sources/pmm and sources/pmm-dump are
+# symlinks to local forks, so they dangle in a standalone CI checkout; `make
+# dc-ci` materializes them by cloning the pinned datacosmos forks before build.
 on:
   push:
     tags:
@@ -101,11 +102,13 @@ jobs:
           echo "::error::could not pull $image after 5 attempts"
           exit 1
 
-      - name: Build pmm-client and pmm-server (native)
+      - name: Build pmm-client and pmm-server (native) and publish to GHCR
         env:
           DC_VERSION: ${{ steps.ver.outputs.dc_version }}
         run: |
-          make dc-build dc-publish DC_VERSION="${DC_VERSION}" IMAGE_ARCH="${IMAGE_ARCH}"
+          # dc-ci materializes the pmm/pmm-dump symlinks (clones the pinned forks),
+          # builds the native images + RPMs, and pushes the images to ghcr.io.
+          make dc-ci DC_VERSION="${DC_VERSION}" IMAGE_ARCH="${IMAGE_ARCH}"
 
       - name: Prepare release assets
         env:

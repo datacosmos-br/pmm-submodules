@@ -42,22 +42,29 @@ specific upstream commit, follow this protocol:
 5. **Gate green before claiming done:** `go build ./...` and `go vet ./<touched>/...` must
    return 0, with 0 conflict markers in every resolved file. Cite command + exit + output.
 
-### Datacosmos build & release targets (`Makefile.datacosmos`)
+### Datacosmos build & release verbs (`Makefile.datacosmos`)
 
-- `make dc-doctor` — read-only preflight: no merge/cherry-pick in progress, clean tree
-  (benign `pmm-submodules` pointer churn ignored), `pmm-submodules` at an immutable gitlink,
-  `pmm-dump` pinned to a tag (fails on a moving branch), circular `pmm` sub-submodule
-  uninitialized. Run this before `dc-build`/`dc-release`.
-- `make dc-build` — depends on `.dc-guard` (fails fast on a merge/cherry-pick or any
-  uncommitted tracked change, because the build **clones HEAD** and would silently ignore
-  working-tree edits) then `.dc-prepare` (bounded submodule init that skips the circular
-  `pmm` graph). Produces `pmm-local/pmm-server` + `pmm-client` images.
-- `make dc-next` — prints the **computed** release tag (stable sync point → `vX.Y.Z-dcN`,
-  else date-based `v3-<date>-dcN`). Never hardcode the tag.
-- `make dc-release` — `.dc-clean-worktree` gate → tag the computed version → CI publishes
-  per-arch GHCR tags (`<DC_VERSION>-amd64`/`-arm64`, leading `v` stripped).
-- `make dc-sync-upstream` — explicit dry-run-default (`APPLY=Y` to merge) upstream sync;
-  never runs implicitly during a build. Lists the protected `DC_RELEASE_COMMIT_PATHS`.
+`sources/pmm` and `sources/pmm-dump` are **symlinks** to the operator's live forks
+(`apps/pmm`, `apps/pmm-dump`) — not submodules. Only the exporter components
+(node_exporter, grafana, …) remain real submodules under `sources/*`. The whole cycle is
+**two operator verbs + one CI verb** (run `make dc-help` to list them):
+
+- `make dc-validate` — local pre-release gate: `go build`/`go vet`/`go test` on both
+  forks (through the symlinks) plus source sanity (symlinks resolve to a `go.mod` tree;
+  `sources/pmm` carries no `pmm-submodules` back-ref). No containers.
+- `make dc-release` — one shot: pushes the fork sources to datacosmos-br
+  (`$(DC_PMM_REF)` on pmm, `$(DC_PMM_DUMP_REF)` on pmm-dump), then `.dc-clean-worktree`
+  gate → tag the **computed** `-dc` version (never hardcode) → push the tag, which triggers
+  CI to build+publish per-arch GHCR images (`<DC_VERSION>-amd64`/`-arm64`, leading `v`
+  stripped) and a GitHub Release. Release files are the protected `DC_RELEASE_COMMIT_PATHS`.
+- `make dc-ci` — **CI only** (`datacosmos-release.yml`): materializes the pmm/pmm-dump
+  symlinks by cloning the pinned forks (`DC_PMM_REPO@DC_PMM_REF`,
+  `DC_PMM_DUMP_REPO@DC_PMM_DUMP_REF`) when they dangle, inits the exporter submodules, runs
+  the upstream `build-server` in-place, collects artifacts, and pushes images. No-op
+  materialize locally (the symlink already resolves).
+
+Source pins live as `DC_PMM_*` / `DC_PMM_DUMP_*` vars in `Makefile.datacosmos`; bump them to
+release a different fork ref.
 
 ## How AI tools load this document
 

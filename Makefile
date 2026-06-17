@@ -9,7 +9,7 @@ endif
 
 default: help
 
-# datacosmos aggregator-root build/release targets (dc-build, dc-publish, dc-release, dc-test-*).
+# datacosmos aggregator-root verbs (dc-validate, dc-release; dc-ci is CI-only). See `make dc-help`.
 -include Makefile.datacosmos
 
 help:                       ## Display this help message.
